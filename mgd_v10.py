@@ -7,11 +7,12 @@ import textwrap
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from streamlit_js_eval import streamlit_js_eval
 
 
@@ -152,23 +153,23 @@ class ConvTree:
 
 
 # -----------------------------------------------------------------------------
-# 2.  Environment & OpenAI client
+# 2.  Environment & Gemini client
 # -----------------------------------------------------------------------------
 
 load_dotenv()
-API_KEY = os.getenv("OPENAI_API_KEY")
+API_KEY = os.getenv("GOOGLE_API_KEY")
 PASSWORD = os.getenv("PASSWORD")
-client = OpenAI(api_key=API_KEY)
+client = genai.Client()
 
 
 # -----------------------------------------------------------------------------
 # 3.  Core generation & conversation helpers
 # -----------------------------------------------------------------------------
 
-def generate_myth_debunk_markdown(topic: str | None, n_misconceptions: int = 3, search_context_size: str = 'medium') -> str:
+def generate_myth_debunk_markdown(topic: str | None, n_misconceptions: int = 3) -> tuple[str, List[Tuple[str, str]]]:
     """
-    Generate psychology myths and debunk them using OpenAI API.
-    Returns a markdown-formatted string to be shown directly in the app.
+    Generate psychology myths and debunk them using Gemini API.
+    Returns a tuple of (markdown-formatted string, list of source links).
     """
     system_instructions = textwrap.dedent(f'''
         You are a psychology myth generator and debunker.
@@ -211,23 +212,55 @@ def generate_myth_debunk_markdown(topic: str | None, n_misconceptions: int = 3, 
         - Aim for misunderstandings that are commonly heard or easily confused with actual scientific findings.
     ''').strip()
 
-    # Note: Using regular chat completion since web_search_preview might not be available
-    # If you have access to web search tools, you can modify this section
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        temperature=1,
-        tools=[{
-            "type": "web_search_preview",
-            # Pass the chosen sidebar option straight through
-            "search_context_size": search_context_size,
-        }],
-        # The whole prompt goes in the `input` field for Responses API
-        input=system_instructions,
-        # Optional but forces the model to *actually* perform a search
-        tool_choice={"type": "web_search_preview"},
+    # Configure Grounding tool for Google Search
+    grounding_tool = types.Tool(google_search=types.GoogleSearch())
+    config = types.GenerateContentConfig(
+        tools=[grounding_tool],
+        temperature=1.0
     )
     
-    return response.output_text
+    response = client.models.generate_content(
+        model="models/gemini-2.5-flash-lite",
+        contents=system_instructions,
+        config=config,
+    )
+
+    # Extract grounding metadata from the first candidate
+    grounding_meta = None
+    if response.candidates:
+        grounding_meta = response.candidates[0].grounding_metadata
+
+    # Parse out the distinct source URLs and titles
+    source_links: List[Tuple[str, str]] = []
+    if grounding_meta and grounding_meta.grounding_chunks:
+        for chunk in grounding_meta.grounding_chunks:
+            # Try different possible attributes for the chunk
+            url = None
+            title = None
+            
+            # Check if chunk has web attribute
+            if hasattr(chunk, 'web') and chunk.web:
+                url = getattr(chunk.web, 'uri', None)
+                title = getattr(chunk.web, 'title', url)
+            # Fallback: check if chunk has direct url attribute
+            elif hasattr(chunk, 'uri'):
+                url = chunk.uri
+                title = getattr(chunk, 'title', url)
+            # Another fallback: check if chunk has url attribute
+            elif hasattr(chunk, 'url'):
+                url = chunk.url
+                title = getattr(chunk, 'title', url)
+            
+            if url:
+                # Use URL as title if no title is available
+                display_title = title if title and title != url else url
+                source_links.append((display_title, url))
+    
+    # Deduplicate while preserving order
+    seen = set()
+    source_links = [x for x in source_links if not (x[1] in seen or seen.add(x[1]))]
+
+    return response.text, source_links
 
 
 def build_system_message(myth_content: str = None) -> str:
@@ -258,30 +291,45 @@ def build_system_message(myth_content: str = None) -> str:
     return base_msg
 
 
-def build_prompt(conv_tree: ConvTree, system_msg: str) -> List[Dict[str, str]]:
+def build_prompt(conv_tree: ConvTree, system_msg: str) -> str:
     """Build conversation prompt from conversation tree."""
-    msgs = [
-        {"role": "system", "content": system_msg},
-    ]
+    prompt_parts = [system_msg]
+    
     for node in conv_tree.path_to_leaf()[1:]:  # skip root
         if node.role in {"user", "assistant"}:
-            msgs.append({"role": node.role, "content": node.content})
-    return msgs
+            role_label = "User" if node.role == "user" else "Assistant"
+            prompt_parts.append(f"{role_label}: {node.content}")
+    
+    return "\n\n".join(prompt_parts)
 
 
 def get_ai_response_for_myth(conv_tree: ConvTree, pending_user_node_id: str, myth_content: str) -> str:
     """Generate assistant reply for follow-up conversation about a specific myth."""
     system_msg = build_system_message(myth_content)
     conv_tree.current_leaf_id = pending_user_node_id
-    messages = build_prompt(conv_tree, system_msg)
+    
+    # Build prompt string for Gemini
+    prompt = build_prompt(conv_tree, system_msg)
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        max_tokens=1500,
-        temperature=1,
-    )
-    return response.choices[0].message.content
+    try:
+        # Configure basic generation (no grounding needed for follow-up conversations)
+        config = types.GenerateContentConfig(
+            temperature=1.0,
+            max_output_tokens=1500
+        )
+        
+        response = client.models.generate_content(
+            model="models/gemini-2.5-flash-lite",
+            contents=prompt,
+            config=config,
+        )
+        return response.text
+    except genai.errors.ClientError as e:
+        error_msg = f"Error: I encountered an API issue. Details: {e}\nPlease try again."
+        return error_msg
+    except Exception as e:
+        error_msg = f"Error: Unexpected issue occurred. Details: {e}\nPlease try again."
+        return error_msg
 
 
 # -----------------------------------------------------------------------------
@@ -660,7 +708,7 @@ if "myth_counter" not in st.session_state:
     st.session_state.myth_counter = 0  # Counter for unique myth IDs
 
 # Helper function to create a new myth tab
-def create_new_myth_tab(myth_content: str, topic: str = None, n_myths: int = 3) -> str:
+def create_new_myth_tab(myth_content: str, source_links: List[Tuple[str, str]], topic: str = None, n_myths: int = 3) -> str:
     """Create a new myth tab and return its ID"""
     st.session_state.myth_counter += 1
     myth_id = f"myth_{st.session_state.myth_counter}"
@@ -681,6 +729,7 @@ def create_new_myth_tab(myth_content: str, topic: str = None, n_myths: int = 3) 
     myth_tab = {
         "id": myth_id,
         "content": myth_content,
+        "source_links": source_links,
         "title": title,
         "topic": topic,
         "n_myths": n_myths
@@ -811,8 +860,8 @@ with tabs[0]:  # App Information tab
 
     st.subheader("How This App Works")
     st.markdown("""
-    - The app uses OpenAI's GPT-4.1-mini model via their application programming interface (API) to generate responses based on user-defined parameters
-    - Each time you click "Generate New Myth", the AI model searches on the internet for psychology-related findings, theories, or interventions, focusing on a specific topic if provided
+    - The app uses Google's Gemini 2.5 Flash Lite model via their application programming interface (API) to generate responses based on user-defined parameters
+    - Each time you click "Generate New Myth", the AI model searches on the internet using Google Search grounding for psychology-related findings, theories, or interventions, focusing on a specific topic if provided
     - Based on its search results, the AI summarises the finding and generates plausible but false misunderstandings or myths about it
     """)
 
@@ -826,6 +875,20 @@ for i, myth_tab in enumerate(st.session_state.myth_tabs):
         # Display the myth content
         st.subheader("🔍 Generated Findings & Myths")
         st.markdown(myth_content)
+        
+        # Display source links if available
+        if myth_tab.get("source_links"):
+            with st.expander("🔗 Show Google Search grounding source links"):
+                for title, url in myth_tab["source_links"]:
+                    # Show both title and full URL
+                    if title and title != url:
+                        st.markdown(f"- **{title}**  \n  [{url}]({url})")
+                    else:
+                        st.markdown(f"- [{url}]({url})")
+        else:
+            with st.expander("🔗 Show Google Search grounding source links"):
+                st.write("No links available.")
+        
         st.markdown("---")
         st.subheader("💬 Follow-Up Conversation")
         st.markdown("Ask follow-up questions about the psychology concepts above:")
@@ -943,7 +1006,6 @@ with tabs[-1]:  # Last tab is always "Generate New Myth"
     
     # Generation Parameters Section
     n_myths = st.slider('**Number of misconceptions**', min_value=1, max_value=10, value=3, key="new_myth_count")
-    context_size = st.selectbox('**Web‑search context size**', options=['low', 'medium', 'high'], index=1, key="new_myth_context")
     
     # Generate button - only enabled if topic is selected/entered
     can_generate = bool(topic and topic.strip())
@@ -953,8 +1015,8 @@ with tabs[-1]:  # Last tab is always "Generate New Myth"
     if st.button("**✨ Generate New Myth Set**", key="generate_new_myth", disabled=not can_generate):
         with st.spinner("Generating new psychology myths and debunking..."):
             try:
-                myth_content = generate_myth_debunk_markdown(topic, n_myths, context_size)
-                myth_id = create_new_myth_tab(myth_content, topic, n_myths)
+                myth_content, source_links = generate_myth_debunk_markdown(topic, n_myths)
+                myth_id = create_new_myth_tab(myth_content, source_links, topic, n_myths)
 
                 # Flag the next rerun so we can auto-switch tabs
                 st.session_state["just_generated"] = True
