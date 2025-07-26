@@ -923,7 +923,9 @@ for i, myth_tab in enumerate(st.session_state.myth_tabs):
         # Display poster image if available
         if myth_tab.get("poster_image"):
             st.subheader("🎨 Educational Poster")
-            st.image(myth_tab["poster_image"], caption=f"Poster for: {myth_tab.get('topic', 'Psychology Concepts')}", width=300)
+            # Use responsive width: fit screen width on mobile, 400px on desktop
+            poster_width = None if IS_MOBILE else 400
+            st.image(myth_tab["poster_image"], caption=f"Poster for: {myth_tab.get('topic', 'Psychology Concepts')}", width=poster_width)
             st.markdown("---")
         
         # Display the myth content
