@@ -8,12 +8,14 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional, Tuple
+from io import BytesIO
 
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from streamlit_js_eval import streamlit_js_eval
+from PIL import Image
 
 
 # -----------------------------------------------------------------------------
@@ -301,6 +303,49 @@ def build_prompt(conv_tree: ConvTree, system_msg: str) -> str:
             prompt_parts.append(f"{role_label}: {node.content}")
     
     return "\n\n".join(prompt_parts)
+
+
+def generate_poster_image(topic: str, max_attempts: int = 3) -> Optional[Image.Image]:
+    """
+    Generate a poster image for the psychology myth topic using Imagen 4.
+    Returns PIL Image if successful, None if failed after max_attempts.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Build a tailored prompt for the poster
+            poster_prompt = f"""Create an educational poster about psychology concept: {topic}. 
+            Style: Modern, scientific illustration with clean typography. 
+            Include visual metaphors and symbols related to psychology and brain science. 
+            Use a professional color palette with blues, greens, and white. 
+            Make it suitable for educational materials."""
+            
+            # Configure image generation
+            config = types.GenerateImagesConfig(
+                number_of_images=1,
+                aspect_ratio="1:1",
+                person_generation="dont_allow",
+                output_mime_type="image/png",
+            )
+            
+            response = client.models.generate_images(
+                model="models/imagen-4.0-generate-preview-06-06",
+                prompt=poster_prompt,
+                config=config,
+            )
+            
+            # Convert GenAI SDK image object → raw bytes → PIL Image
+            genai_img = response.generated_images[0].image
+            raw = genai_img.image_bytes                   # bytes payload
+            poster_img = Image.open(BytesIO(raw))          # now a proper PIL.Image.Image
+            return poster_img
+                
+        except Exception as e:
+            if attempt < max_attempts:
+                st.warning(f"Poster generation attempt {attempt} failed: {e}. Retrying...")
+            else:
+                st.warning(f"Could not generate poster after {max_attempts} attempts. Last error: {e}")
+    
+    return None
 
 
 def get_ai_response_for_myth(conv_tree: ConvTree, pending_user_node_id: str, myth_content: str) -> str:
@@ -708,7 +753,7 @@ if "myth_counter" not in st.session_state:
     st.session_state.myth_counter = 0  # Counter for unique myth IDs
 
 # Helper function to create a new myth tab
-def create_new_myth_tab(myth_content: str, source_links: List[Tuple[str, str]], topic: str = None, n_myths: int = 3) -> str:
+def create_new_myth_tab(myth_content: str, source_links: List[Tuple[str, str]], topic: str = None, n_myths: int = 3, poster_image: Optional[Image.Image] = None) -> str:
     """Create a new myth tab and return its ID"""
     st.session_state.myth_counter += 1
     myth_id = f"myth_{st.session_state.myth_counter}"
@@ -732,7 +777,8 @@ def create_new_myth_tab(myth_content: str, source_links: List[Tuple[str, str]], 
         "source_links": source_links,
         "title": title,
         "topic": topic,
-        "n_myths": n_myths
+        "n_myths": n_myths,
+        "poster_image": poster_image
     }
     
     # Add to tabs list
@@ -853,9 +899,10 @@ with tabs[0]:  # App Information tab
     st.subheader("How to Use This App")
     st.markdown("""
     1. **Generate New Myths**: Use the "Generate New Myth" tab to create sets of psychology myths and accurate findings
-    2. **Set Parameters** Select the number of myths and optional focus topic to tailor the content
-    3. **Explore Myths**: Each generated myth set gets its own tab for focused exploration
-    4. **Follow-Up Conversations**: Use the chat feature in each myth tab to ask follow-up questions about the psychology concepts
+    2. **Set Parameters**: Select the number of myths and optional focus topic to tailor the content
+    3. **Optional Poster Generation**: Check the "Generate poster" option to create an educational poster using AI image generation
+    4. **Explore Myths**: Each generated myth set gets its own tab for focused exploration
+    5. **Follow-Up Conversations**: Use the chat feature in each myth tab to ask follow-up questions about the psychology concepts
     """)
 
     st.subheader("How This App Works")
@@ -863,6 +910,7 @@ with tabs[0]:  # App Information tab
     - The app uses Google's Gemini 2.5 Flash Lite model via their application programming interface (API) to generate responses based on user-defined parameters
     - Each time you click "Generate New Myth", the AI model searches on the internet using Google Search grounding for psychology-related findings, theories, or interventions, focusing on a specific topic if provided
     - Based on its search results, the AI summarises the finding and generates plausible but false misunderstandings or myths about it
+    - When the poster option is enabled, the app uses Google's Imagen 4 model to generate educational posters related to the psychology topic
     """)
 
 
@@ -871,6 +919,12 @@ for i, myth_tab in enumerate(st.session_state.myth_tabs):
     with tabs[i + 1]:  # +1 because first tab is App Information
         myth_id = myth_tab["id"]
         myth_content = myth_tab["content"]
+        
+        # Display poster image if available
+        if myth_tab.get("poster_image"):
+            st.subheader("🎨 Educational Poster")
+            st.image(myth_tab["poster_image"], caption=f"Poster for: {myth_tab.get('topic', 'Psychology Concepts')}", width=400)
+            st.markdown("---")
         
         # Display the myth content
         st.subheader("🔍 Generated Findings & Myths")
@@ -1007,6 +1061,14 @@ with tabs[-1]:  # Last tab is always "Generate New Myth"
     # Generation Parameters Section
     n_myths = st.slider('**Number of misconceptions**', min_value=1, max_value=10, value=3, key="new_myth_count")
     
+    # Poster generation option
+    poster_enabled = st.toggle(
+        "🎨 Generate poster for this myth", 
+        value=False,
+        help="When enabled, generate a themed poster above your myth using Imagen 4",
+        key="poster_enabled"
+    )
+    
     # Generate button - only enabled if topic is selected/entered
     can_generate = bool(topic and topic.strip())
     
@@ -1016,7 +1078,14 @@ with tabs[-1]:  # Last tab is always "Generate New Myth"
         with st.spinner("Generating new psychology myths and debunking..."):
             try:
                 myth_content, source_links = generate_myth_debunk_markdown(topic, n_myths)
-                myth_id = create_new_myth_tab(myth_content, source_links, topic, n_myths)
+                
+                # Generate poster if enabled
+                poster_image = None
+                if poster_enabled:
+                    with st.spinner("Generating poster..."):
+                        poster_image = generate_poster_image(topic)
+                
+                myth_id = create_new_myth_tab(myth_content, source_links, topic, n_myths, poster_image)
 
                 # Flag the next rerun so we can auto-switch tabs
                 st.session_state["just_generated"] = True
