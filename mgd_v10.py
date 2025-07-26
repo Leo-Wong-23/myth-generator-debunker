@@ -923,7 +923,7 @@ for i, myth_tab in enumerate(st.session_state.myth_tabs):
         # Display poster image if available
         if myth_tab.get("poster_image"):
             st.subheader("🎨 Educational Poster")
-            st.image(myth_tab["poster_image"], caption=f"Poster for: {myth_tab.get('topic', 'Psychology Concepts')}", width=400)
+            st.image(myth_tab["poster_image"], caption=f"Poster for: {myth_tab.get('topic', 'Psychology Concepts')}", width=350)
             st.markdown("---")
         
         # Display the myth content
